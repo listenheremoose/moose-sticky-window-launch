@@ -1,0 +1,11 @@
+[package]
+name = "moose-sticky-window-launch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "c0cff4db", default-features = false, features = ["client"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
