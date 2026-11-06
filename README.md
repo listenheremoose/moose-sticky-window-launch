@@ -43,11 +43,10 @@ It runs quietly in the background and starts on its own each time you log in.
 
 ## Installing
 
-1. In the terminal, go to this project's folder. If it's where this README
-   lives, for example:
+1. In the terminal, go to where you downloaded this code, for example:
 
    ```sh
-   cd ~/code/moose-sticky-window-launch
+   cd ~/Downloads/moose-sticky-window-launch
    ```
 
 2. Run the installer:
