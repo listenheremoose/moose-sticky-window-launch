@@ -1,15 +1,16 @@
 //! moose-sticky-window-launch
 //!
-//! A small COSMIC (cosmic-comp) daemon that remembers which monitor and
-//! workspace each app's window was last on, and moves the app's window back
-//! there the next time it opens, as long as that monitor and workspace still
-//! exist.
+//! A small COSMIC (cosmic-comp) daemon that remembers which monitor each app's
+//! window was last on, and moves the app's window back to that monitor the next
+//! time it opens (if the monitor is connected). It never changes which
+//! workspace you're on: the window lands on the workspace currently shown on
+//! that monitor.
 //!
 //! Protocols used:
 //! - ext_foreign_toplevel_list_v1   : learn about windows (app_id, title, open/close)
-//! - zcosmic_toplevel_info_v1 (v3)  : which ext workspace / output each window is on
-//! - zcosmic_toplevel_manager_v1 (v4): move_to_ext_workspace
-//! - ext_workspace_manager_v1       : workspaces, workspace groups, and their outputs
+//! - zcosmic_toplevel_info_v1 (v3)  : which output / ext workspace each window is on
+//! - zcosmic_toplevel_manager_v1 (v4): move_to_ext_workspace (the only "move" request)
+//! - ext_workspace_manager_v1       : workspaces, which one is active, and their outputs
 //! - wl_output (v4)                 : connector names (e.g. "DP-1") for stable matching
 
 use std::{
@@ -58,6 +59,7 @@ macro_rules! log {
 // Persistent data
 // ---------------------------------------------------------------------------
 
+/// Older versions also stored workspace fields; serde ignores them on load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Placement {
     /// Connector name, e.g. "DP-1", "eDP-1", "HDMI-A-1".
@@ -65,12 +67,6 @@ struct Placement {
     /// Human-readable monitor description (make/model), informational.
     #[serde(default)]
     output_description: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_name: Option<String>,
-    #[serde(default)]
-    workspace_coordinates: Vec<u32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -79,23 +75,13 @@ struct Db {
     apps: HashMap<String, Placement>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Config {
     /// app_ids that should never be moved or remembered.
     exclude: Vec<String>,
-    /// Switch to the target workspace and focus the window after moving it.
+    /// Focus the window after moving it to its monitor.
     follow: bool,
-    /// If the remembered workspace no longer exists on that monitor, move the
-    /// window to the trailing empty workspace instead (COSMIC then adds a new
-    /// empty one after it, so this effectively creates a workspace).
-    create_missing_workspace: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self { exclude: Vec::new(), follow: false, create_missing_workspace: true }
-    }
 }
 
 fn state_path() -> PathBuf {
@@ -165,6 +151,7 @@ struct Workspace {
     id: Option<String>,
     name: Option<String>,
     coordinates: Vec<u32>,
+    active: bool,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -186,9 +173,11 @@ struct Window {
     got_ext_done: bool,
     got_cosmic_state: bool,
     workspaces: Vec<wsh::ExtWorkspaceHandleV1>,
+    outputs: Vec<wl_output::WlOutput>,
     sticky: bool,
     restore: Restore,
-    target: Option<ObjectId>,
+    /// Output name we asked the compositor to move this window to.
+    target: Option<String>,
     last_placement: Option<Placement>,
 }
 
@@ -230,83 +219,42 @@ impl State {
             .find(|g| g.workspaces.iter().any(|w| &w.id() == ws))
     }
 
-    /// Where is this window right now?
+    /// Which monitor is this window on right now?
     fn placement_of(&self, win: &Window) -> Option<Placement> {
         if win.sticky || win.workspaces.len() != 1 {
             return None;
         }
-        let ws_id = win.workspaces[0].id();
-        let ws = self.workspaces.get(&ws_id)?;
-        let group = self.group_of(&ws_id)?;
-        let out = self.outputs.get(&group.outputs.first()?.id())?;
-        Some(Placement {
-            output: out.name.clone()?,
-            output_description: out.description.clone(),
-            workspace_id: ws.id.clone(),
-            workspace_name: ws.name.clone(),
-            workspace_coordinates: ws.coordinates.clone(),
-        })
+        let group = self.group_of(&win.workspaces[0].id())?;
+        // Output-bound workspaces (COSMIC default): the group has one output.
+        // Global workspaces: the group spans all outputs, so use the output
+        // the window itself is on.
+        let out = match (group.outputs.as_slice(), win.outputs.as_slice()) {
+            ([o], _) => o,
+            (_, [o]) => o,
+            _ => return None,
+        };
+        let out = self.outputs.get(&out.id())?;
+        Some(Placement { output: out.name.clone()?, output_description: out.description.clone() })
     }
 
-    /// Find a live workspace + output matching a remembered placement.
-    /// Returns the target workspace, its output, and whether it is the
-    /// "new workspace" fallback rather than the remembered one.
-    /// `moving` is the window being placed (ignored when checking emptiness).
-    fn resolve(
-        &self,
-        p: &Placement,
-        moving: &ObjectId,
-    ) -> Option<(wsh::ExtWorkspaceHandleV1, wl_output::WlOutput, bool)> {
+    /// Find the remembered monitor and the workspace currently shown on it.
+    fn resolve(&self, p: &Placement) -> Result<(wsh::ExtWorkspaceHandleV1, wl_output::WlOutput), String> {
         let out = self
             .outputs
             .values()
-            .find(|o| o.name.as_deref() == Some(p.output.as_str()))?;
+            .find(|o| o.name.as_deref() == Some(p.output.as_str()))
+            .ok_or_else(|| format!("monitor {} is not connected", p.output))?;
         let group = self
             .groups
             .values()
-            .find(|g| g.outputs.iter().any(|o| o.id() == out.obj.id()))?;
-        let candidates = || {
-            group
-                .workspaces
-                .iter()
-                .filter_map(|h| self.workspaces.get(&h.id()).map(|w| (h, w)))
-        };
-        let found = p
-            .workspace_id
-            .as_ref()
-            .filter(|id| !id.is_empty())
-            .and_then(|id| candidates().find(|(_, w)| w.id.as_ref() == Some(id)))
-            .or_else(|| {
-                (!p.workspace_coordinates.is_empty())
-                    .then(|| candidates().find(|(_, w)| w.coordinates == p.workspace_coordinates))
-                    .flatten()
-            })
-            .or_else(|| {
-                p.workspace_name
-                    .as_ref()
-                    .and_then(|n| candidates().find(|(_, w)| w.name.as_ref() == Some(n)))
-            });
-        if let Some((h, _)) = found {
-            return Some((h.clone(), out.obj.clone(), false));
-        }
-
-        // Fallback: COSMIC ignores ext_workspace create requests, but always
-        // keeps one empty workspace at the end of each monitor. Putting the
-        // window there makes it a real workspace and COSMIC appends a new
-        // empty one.
-        if !self.config.create_missing_workspace {
-            return None;
-        }
-        let (last, _) = candidates().max_by(|(_, a), (_, b)| a.coordinates.cmp(&b.coordinates))?;
-        let last_id = last.id();
-        let occupied = self
-            .windows
+            .find(|g| g.outputs.iter().any(|o| o.id() == out.obj.id()))
+            .ok_or_else(|| format!("no workspaces found for monitor {}", p.output))?;
+        let active = group
+            .workspaces
             .iter()
-            .any(|(wid, w)| wid != moving && w.workspaces.iter().any(|x| x.id() == last_id));
-        if occupied {
-            return None;
-        }
-        Some((last.clone(), out.obj.clone(), true))
+            .find(|h| self.workspaces.get(&h.id()).is_some_and(|w| w.active))
+            .ok_or_else(|| format!("no active workspace on monitor {}", p.output))?;
+        Ok((active.clone(), out.obj.clone()))
     }
 
     /// Called after every zcosmic_toplevel_info_v1.done: decide restores and
@@ -331,7 +279,7 @@ impl State {
         let app_id = win.app_id.clone().unwrap_or_default();
         let title = win.title.clone().unwrap_or_default();
 
-        let decision: Result<(wsh::ExtWorkspaceHandleV1, wl_output::WlOutput, bool), String> = (|| {
+        let decision: Result<(wsh::ExtWorkspaceHandleV1, wl_output::WlOutput), String> = (|| {
             if app_id.is_empty() {
                 return Err("no app_id".into());
             }
@@ -345,16 +293,13 @@ impl State {
                 return Err("another window of this app is already open".into());
             }
             let p = self.db.apps.get(&app_id).ok_or("no remembered placement")?;
-            let (ws, out, fallback) = self
-                .resolve(p, id)
-                .ok_or_else(|| format!("remembered spot {p:?} no longer exists"))?;
-            if win.workspaces.iter().any(|w| w.id() == ws.id()) {
-                return Err("already on the remembered workspace".into());
+            if self.placement_of(win).is_some_and(|cur| cur.output == p.output) {
+                return Err(format!("already on monitor {}", p.output));
             }
-            Ok((ws, out, fallback))
+            self.resolve(p)
         })();
 
-        let (ws, out, fallback) = match decision {
+        let (ws, out) = match decision {
             Ok(t) => t,
             Err(why) => {
                 log!("open  {app_id:?} ({title:?}): not moving: {why}");
@@ -364,35 +309,18 @@ impl State {
         };
 
         let (Some(mgr), Some(cosmic)) = (&self.cosmic_manager, &win.cosmic) else { return };
-        let p = &self.db.apps[&app_id];
-        let target_name = self
-            .workspaces
-            .get(&ws.id())
-            .and_then(|w| w.name.clone())
-            .unwrap_or_else(|| "?".into());
-        if fallback {
-            log!(
-                "open  {app_id:?} ({title:?}): workspace {} on {} is gone; moving to new workspace {target_name}",
-                p.workspace_name.as_deref().unwrap_or("?"),
-                p.output,
-            );
-        } else {
-            log!("open  {app_id:?} ({title:?}): moving to output {} workspace {target_name}", p.output);
-        }
+        let target = self.db.apps[&app_id].output.clone();
+        log!("open  {app_id:?} ({title:?}): moving to monitor {target}");
         mgr.move_to_ext_workspace(cosmic, &ws, &out);
-        if self.config.follow {
-            ws.activate();
-            if let Some(wm) = &self.workspace_manager {
-                wm.commit();
-            }
-            if let Some(seat) = &self.seat {
-                mgr.activate(cosmic, seat);
-            }
+        if self.config.follow
+            && let Some(seat) = &self.seat
+        {
+            mgr.activate(cosmic, seat);
         }
         let _ = qh;
         let win = self.windows.get_mut(id).unwrap();
         win.restore = Restore::Moving { tries: 0 };
-        win.target = Some(ws.id());
+        win.target = Some(target);
     }
 
     /// Update the remembered placement for a window. Returns true if the db changed.
@@ -402,10 +330,7 @@ impl State {
 
         // Track where a requested move ended up.
         if let Restore::Moving { tries } = win.restore {
-            let landed = win
-                .target
-                .as_ref()
-                .is_some_and(|t| win.workspaces.iter().any(|w| &w.id() == t));
+            let landed = placement.as_ref().map(|p| &p.output) == win.target.as_ref();
             let win = self.windows.get_mut(id).unwrap();
             if landed {
                 win.restore = Restore::Done;
@@ -451,11 +376,7 @@ impl State {
             && !self.excluded(&app_id)
             && !self.in_output_grace()
         {
-            log!(
-                "close {app_id:?}: remembering output {} workspace {}",
-                p.output,
-                p.workspace_name.as_deref().unwrap_or("?")
-            );
+            log!("close {app_id:?}: remembering monitor {}", p.output);
             if self.db.apps.get(&app_id) != Some(&p) {
                 self.db.apps.insert(app_id, p);
                 save_db(&self.db);
@@ -634,6 +555,11 @@ impl Dispatch<wsh::ExtWorkspaceHandleV1, ()> for State {
         match event {
             wsh::Event::Id { id } => w.id = Some(id).filter(|i| !i.is_empty()),
             wsh::Event::Name { name } => w.name = Some(name),
+            wsh::Event::State { state } => {
+                w.active = state
+                    .into_result()
+                    .is_ok_and(|s| s.contains(wsh::State::Active));
+            }
             wsh::Event::Coordinates { coordinates } => {
                 w.coordinates = coordinates
                     .chunks_exact(4)
@@ -676,6 +602,7 @@ impl Dispatch<ftl::ExtForeignToplevelListV1, ()> for State {
                         got_ext_done: false,
                         got_cosmic_state: false,
                         workspaces: Vec::new(),
+                        outputs: Vec::new(),
                         sticky: false,
                         restore,
                         target: None,
@@ -754,6 +681,8 @@ impl Dispatch<cth::ZcosmicToplevelHandleV1, ()> for State {
                     w.workspaces.push(workspace);
                 }
             cth::Event::ExtWorkspaceLeave { workspace } => w.workspaces.retain(|x| x != &workspace),
+            cth::Event::OutputEnter { output } if !w.outputs.contains(&output) => w.outputs.push(output),
+            cth::Event::OutputLeave { output } => w.outputs.retain(|x| x != &output),
             cth::Event::State { state: s } => {
                 w.got_cosmic_state = true;
                 w.sticky = s
@@ -798,10 +727,11 @@ fn dump(state: &State) {
         for h in &g.workspaces {
             if let Some(w) = state.workspaces.get(&h.id()) {
                 println!(
-                    "    name={:?} id={:?} coords={:?}",
+                    "    name={:?} id={:?} coords={:?}{}",
                     w.name.as_deref().unwrap_or(""),
                     w.id.as_deref().unwrap_or(""),
-                    w.coordinates
+                    w.coordinates,
+                    if w.active { "  (showing)" } else { "" }
                 );
             }
         }
@@ -813,8 +743,7 @@ fn dump(state: &State) {
             "  {:<40} {:?} -> {}",
             w.app_id.as_deref().unwrap_or("?"),
             w.title.as_deref().unwrap_or(""),
-            p.map(|p| format!("{} / ws {}", p.output, p.workspace_name.unwrap_or_default()))
-                .unwrap_or_else(|| "(unknown / sticky)".into())
+            p.map(|p| p.output).unwrap_or_else(|| "(unknown / sticky)".into())
         );
     }
     println!("\nState file: {}", state_path().display());
@@ -826,7 +755,7 @@ fn main() {
     let dump_only = args.iter().any(|a| a == "--dump");
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "{APP}: reopen COSMIC windows on the monitor/workspace they were last on.\n\n\
+            "{APP}: reopen COSMIC windows on the monitor they were last on.\n\n\
              Usage: {APP} [--dump]\n\n  --dump   print monitors, workspaces and windows, then exit\n\n\
              State:  {}\nConfig: {}  (optional) {{\"exclude\": [\"app.id\"], \"follow\": false}}",
             state_path().display(),

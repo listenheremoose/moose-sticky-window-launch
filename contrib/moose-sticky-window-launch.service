@@ -1,5 +1,5 @@
 [Unit]
-Description=Reopen COSMIC windows on the monitor/workspace they were last on
+Description=Reopen COSMIC windows on the monitor they were last on
 PartOf=graphical-session.target
 After=graphical-session.target cosmic-session.target
 

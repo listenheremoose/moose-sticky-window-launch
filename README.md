@@ -1,14 +1,18 @@
 # moose-sticky-window-launch
 
-**Make apps reopen on the same screen and workspace you last used them on.**
+**Make apps reopen on the same screen you last used them on.**
 
-By default, the COSMIC desktop on Pop!_OS opens every app on whatever workspace
-you're looking at. This tool remembers where each app was when you closed it.
-The next time you open that app, it moves the window back there for you.
+If you have more than one monitor, the COSMIC desktop on Pop!_OS opens new
+apps on whichever screen you're using at the moment. This tool remembers which
+screen each app was on when you closed it. The next time you open that app, it
+moves the window back to that screen for you.
 
-For example, if you keep your browser on workspace 2 and your chat app on
-workspace 3 of your second monitor, they'll go back to those spots every time
-you open them, including after a restart.
+For example, if you keep your chat app on your second monitor, it'll open
+there every time, including after a restart.
+
+It never moves you between workspaces. The window opens on whichever
+workspace is currently showing on that screen, so you won't get pulled to a
+different one.
 
 It runs quietly in the background and starts on its own each time you log in.
 
@@ -64,9 +68,12 @@ You don't need to keep the terminal open.
 ### Checking that it works
 
 1. Open an app, for example the Text Editor.
-2. Move it to a different workspace.
+2. Drag it to your other monitor.
 3. Close it.
-4. Open it again. It should jump to the workspace you left it on.
+4. Click on your first monitor, then open the app again. It should open on
+   the monitor you left it on.
+
+(With only one monitor, there's nothing for this tool to do.)
 
 Want to watch what it's doing? Run this, then open and close some apps:
 
@@ -97,29 +104,23 @@ back on.
 
 ## How it decides where windows go
 
-- **It remembers each app, not each window.** Wherever you last closed an app
-  is where it opens next time.
+- **It remembers each app, not each window.** Whichever screen you last closed
+  an app on is where it opens next time.
+- **It only picks the screen, never the workspace.** The window goes onto
+  whatever workspace that screen is showing right now.
 - **Only the app's first window is moved.** If an app is already open,
   new windows from it (like a second browser window or a "Save as" dialog)
   open normally, so they don't jump away from you.
 - **Windows that were already open when it started are left alone.**
 - **If the screen isn't connected** (say you saved a spot on your external
   monitor but you're on just your laptop now), the window opens normally.
-- **If the workspace is gone.** COSMIC deletes empty workspaces on its own,
-  so the one you used may not exist anymore. In that case the window goes to
-  a fresh workspace at the end of that screen. That may not be the same number
-  as before. For example, if it was on workspace 5 but you now only have 1 and
-  2, it lands on 3.
 - **Plugging in or unplugging a monitor won't mess up your saved spots.** For
   10 seconds afterward, the tool ignores window movement while COSMIC
   rearranges things.
 - **Windows set to show on all workspaces** are ignored.
-- **You may see the window flash briefly** on your current workspace before it
+- **You may see the window flash briefly** on your current screen before it
   moves. On Linux's modern display system (Wayland), a tool like this can only
   move a window after the window has appeared, so this is normal.
-
-> **Tip:** If you want apps to always land on the exact same workspace number,
-> **pin** your workspaces in COSMIC. Pinned workspaces are never deleted.
 
 ---
 
@@ -139,16 +140,14 @@ Put this in it and change whatever you like:
 ```json
 {
   "exclude": [],
-  "follow": false,
-  "create_missing_workspace": true
+  "follow": false
 }
 ```
 
 | Setting | What it does |
 |---|---|
 | `exclude` | Apps the tool should never move or remember. See below for how to find an app's name. Example: `["com.system76.CosmicTerm", "firefox"]` |
-| `follow` | `true` = when an app gets moved, take you to that workspace too. `false` (default) = you stay where you are and the app opens on its own workspace. |
-| `create_missing_workspace` | `true` (default) = if the saved workspace is gone, use a fresh one at the end. `false` = just open the app normally. |
+| `follow` | `true` = after moving an app to its screen, make it the active window so you can start typing in it right away. `false` (default) = just move it. |
 
 After saving the file, restart the tool so it reads your changes:
 
@@ -166,7 +165,7 @@ moose-sticky-window-launch --dump
 ```
 
 Look under **Windows:**. The left column is the app id, and the right side
-shows which screen and workspace it's on.
+shows which screen it's on.
 
 ---
 
@@ -219,11 +218,12 @@ For the curious. You don't need this to use the tool.
   (`~/.config/systemd/user/moose-sticky-window-launch.service`).
 - Saved spots live in `~/.local/state/moose-sticky-window-launch/placements.json`,
   keyed by Wayland app id. Monitors are matched by connector name (`DP-2`,
-  `HDMI-A-1`, …), and workspaces by id, then position, then name.
+  `HDMI-A-1`, …).
 - Wayland protocols used: `ext_foreign_toplevel_list_v1`,
   `zcosmic_toplevel_info_v1` (v3), `zcosmic_toplevel_manager_v1` (v4,
   `move_to_ext_workspace`), `ext_workspace_manager_v1`, `wl_output` (v4).
   COSMIC only offers these to unsandboxed programs.
-- cosmic-comp currently ignores `ext_workspace_group_handle_v1.create_workspace`,
-  so the "missing workspace" fallback moves the window onto the trailing empty
-  workspace that COSMIC always keeps, and COSMIC then adds another one.
+- COSMIC's only "move window" request is `move_to_ext_workspace(window,
+  workspace, output)`, so the tool moves the window to the workspace that's
+  currently active on the target monitor. Works with both per-monitor and
+  global workspace modes.
