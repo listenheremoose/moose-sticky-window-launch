@@ -227,3 +227,5 @@ For the curious. You don't need this to use the tool.
   workspace, output)`, so the tool moves the window to the workspace that's
   currently active on the target monitor. Works with both per-monitor and
   global workspace modes.
+
+---
